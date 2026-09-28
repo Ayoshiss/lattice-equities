@@ -40,14 +40,20 @@ mod circuits {
     }
 
     #[instruction]
-    pub fn place_order(order_ctxt: Enc<Shared, Order>, book_ctxt: Enc<Mxe, PackedBook>) -> Enc<Mxe, PackedBook> {
+    pub fn place_order(
+        order_ctxt: Enc<Shared, Order>,
+        book_ctxt: Enc<Mxe, PackedBook>,
+        base_deposit: u64,
+        quote_deposit: u64,
+    ) -> Enc<Mxe, PackedBook> {
         let order = order_ctxt.to_arcis();
         let mut book = book_ctxt.to_arcis().unpack();
+        let qty = covered_qty(order.side, order.price, order.qty, base_deposit, quote_deposit);
         for i in 0..N {
             if book.count == i as u8 {
                 book.sides[i] = order.side;
                 book.prices[i] = order.price;
-                book.qtys[i] = order.qty;
+                book.qtys[i] = qty;
             }
         }
         if (book.count as usize) < N {
@@ -61,6 +67,19 @@ mod circuits {
         let book = book_ctxt.to_arcis().unpack();
         let (price, matched, fills) = clear_book(book.sides, book.prices, book.qtys, band_lo, band_hi);
         ClearResult { price, matched, fills }.reveal()
+    }
+
+    // The deposits are public; the order is not, so solvency is checked here.
+    // A buy must be covered by quote (qty lots at its limit), a sell by base lots.
+    // An uncovered order is kept at qty 0: it never fills and is refunded in full.
+    pub fn covered_qty(side: u8, price: u32, qty: u64, base_deposit: u64, quote_deposit: u64) -> u64 {
+        let cost = qty as u128 * price as u128;
+        let ok = if side == BUY {
+            base_deposit == 0 && cost <= quote_deposit as u128
+        } else {
+            quote_deposit == 0 && qty <= base_deposit
+        };
+        if ok { qty } else { 0 }
     }
 
     fn better_of(v1: u64, p1: u32, v2: u64, p2: u32) -> (u64, u32) {
@@ -155,7 +174,18 @@ mod circuits {
 
 #[cfg(test)]
 mod clearing_tests {
-    use super::circuits::{clear_book, N};
+    use super::circuits::{clear_book, covered_qty, N};
+
+    #[test]
+    fn deposits_must_cover_the_order() {
+        assert_eq!(covered_qty(1, 100, 5, 0, 500), 5);
+        assert_eq!(covered_qty(1, 100, 5, 0, 499), 0);
+        assert_eq!(covered_qty(1, 100, 5, 1, 500), 0);
+        assert_eq!(covered_qty(0, 100, 5, 5, 0), 5);
+        assert_eq!(covered_qty(0, 100, 5, 4, 0), 0);
+        assert_eq!(covered_qty(0, 100, 5, 5, 1), 0);
+        assert_eq!(covered_qty(1, u32::MAX, u64::MAX, 0, u64::MAX), 0);
+    }
 
     const WIDE: (u32, u32) = (0, u32::MAX);
 

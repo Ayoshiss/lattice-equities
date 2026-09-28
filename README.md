@@ -16,15 +16,25 @@ encrypted.
 
 ## How it works
 
-1. **Open a book.** `create_book` creates a `Book` account and Arcium writes an
-   empty order book into it, encrypted to the MXE. The key is split across
-   Arcium's nodes, so no single node can decrypt it.
+1. **Open a book.** `create_book` creates a `Book` for a base token (the stock)
+   and a quote token, with a lot size. Arcium writes an empty order book into
+   it, encrypted to the MXE. The key is split across Arcium's nodes, so no
+   single node can decrypt it. `open_vaults` creates the book's token vaults.
 2. **Submit orders.** The trader encrypts side, limit price and quantity on
-   their own device and calls `submit_order`. Arcium adds the order to the
-   encrypted book and writes it back.
+   their own device and calls `submit_order` with a deposit: quote tokens for a
+   buy, whole lots of base for a sell. The deposit goes to the vault and an
+   `OrderTicket` account records it. Arcium checks inside the computation that
+   the deposit covers the order, then adds it to the encrypted book.
 3. **Clear.** `clear_batch` passes the book and a public price band to Arcium.
    The nodes compute the clearing price and each order's fill without
    decrypting anything, then reveal only the result.
+4. **Settle.** `settle_order` pays out one ticket and closes it. A buyer gets
+   base lots plus any unspent quote; a seller gets quote plus any unsold base.
+   Anyone can call it, but tokens only go to the ticket's trader.
+
+If an encrypted computation fails, the book is not left locked: a failed order
+marks its ticket refundable (`refund_failed_order`), and a failed clear reopens
+the book so it can be cleared again.
 
 ### Clearing rules
 
@@ -35,7 +45,11 @@ encrypted.
   clearing price.
 - The smaller side fills completely. The larger side is rationed in arrival
   order, so total bought always equals total sold.
-- Quantities are in base-token units on both sides.
+- Quantities are in lots and prices in quote units per lot, so all math is in
+  whole numbers.
+- An order whose deposit does not cover it (quantity times limit for a buy,
+  quantity in lots for a sell) is kept at zero quantity inside the computation.
+  It never fills and is refunded in full, and nothing about it is revealed.
 
 ### What is revealed
 
@@ -45,8 +59,10 @@ encrypted.
 | Total matched volume | Size and side of unfilled orders |
 | Fill for each order slot | The order book itself, before and after |
 
-Token deposits and payouts are ordinary transfers and are visible on-chain.
-What stays private is price and intent.
+Deposits and payouts are ordinary token transfers and are visible on-chain,
+so the side of an order and an upper bound on its size are public. What stays
+private is the limit price, the exact size, and everything about orders that
+do not fill.
 
 ## Layout
 
@@ -54,12 +70,17 @@ What stays private is price and intent.
 |------|------------|
 | `encrypted-ixs/src/lib.rs` | Arcis circuits: `init_book`, `place_order`, `clear`, plus unit tests for the clearing logic |
 | `programs/lattice_equities/src/lib.rs` | Anchor program that queues each circuit and stores results in callbacks |
-| `tests/lattice_equities.ts` | End-to-end run of a 16-order batch, checked against a plain TypeScript implementation |
-| `build/*.arcis` | Compiled circuits, fetched by Arcium nodes from this repo |
+| `tests/lattice_equities.ts` | End-to-end batch with real token deposits and settlement, checked against a plain TypeScript implementation |
+| `circuits/` | Published circuits, named `<circuit>-<first 8 hex of SHA-256>.arcis`. Arcium nodes fetch them from here |
+| `scripts/publish-circuits.sh` | Copies fresh builds into `circuits/`. Existing files are never overwritten |
 
 A book holds 16 orders. It is stored packed as 9 ciphertexts so each update fits
 in one Solana transaction. One order is processed at a time, so every update
 sees the latest book.
+
+Circuit files are content-addressed and never replaced, so a deployed program
+always finds the exact circuit it was registered with, even after new ones are
+published.
 
 ## Build and test
 
@@ -69,8 +90,19 @@ Requires Rust, Solana CLI, Anchor 1.0.2, Yarn, Docker and the Arcium CLI
 ```bash
 yarn install
 arcium build
-arcium test
 ```
+
+Deployed builds fetch circuits from `circuits/` on GitHub. For local tests,
+build the program with `local-circuits` so the local network uses the circuits
+from your own build instead:
+
+```bash
+arcium build --skip-program
+anchor build -- --features local-circuits
+arcium test --skip-build
+```
+
+Rebuild without the feature before deploying.
 
 Unit tests for the clearing logic run as plain Rust, including a check that the
 circuit matches a simple reference implementation on 20,000 random books:
@@ -90,11 +122,14 @@ export CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG_ASSERTIONS=false
 ## Verifying the circuits
 
 The program pins each circuit by SHA-256 (`circuit_hash!`), and Arcium nodes
-refuse a file that does not match. The build is deterministic, so to check that
-the committed files are what the source compiles to, rebuild and confirm git
-sees no change:
+refuse a file that does not match. The build is deterministic, so anyone can
+rebuild and confirm the output matches the published file:
 
 ```bash
 arcium build
-git status --short build/
+shasum -a 256 build/*.arcis
+ls circuits/
 ```
+
+Each file in `circuits/` is named after the first 8 hex characters of its hash,
+so the two lists should line up.

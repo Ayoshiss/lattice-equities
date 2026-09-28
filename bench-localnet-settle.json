@@ -1,0 +1,14 @@
+{
+  "create_book_ms": 3036,
+  "place_order_ms": [
+    7975,
+    3398,
+    3405,
+    3491,
+    3502
+  ],
+  "clear_ms": 5399,
+  "order_avg_ms": 4354.2,
+  "price": 97,
+  "matched": 7
+}

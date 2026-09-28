@@ -26,8 +26,10 @@ import {
 import * as fs from "fs";
 import * as os from "os";
 import { expect } from "chai";
+import { createMint, createAccount, mintTo, getAccount } from "@solana/spl-token";
 
 const N = 16;
+const LOT_SIZE = 10;
 const BUY = 1;
 const SELL = 0;
 type Order = { side: number; price: number; qty: number };
@@ -92,23 +94,66 @@ describe("LatticeEquities", () => {
     }
   });
 
-  it("clears a 16-order encrypted batch and records timings", async () => {
+  it("clears an encrypted batch, settles every order and records timings", async () => {
     const mxePublicKey = await getMXEPublicKeyWithRetry(provider, program.programId);
     const privateKey = x25519.utils.randomSecretKey();
     const publicKey = x25519.getPublicKey(privateKey);
     const cipher = new RescueCipher(x25519.getSharedSecret(privateKey, mxePublicKey));
 
-    const orders: Order[] = [];
+    const allOrders: Order[] = [];
     for (let k = 0; k < 8; k++) {
-      orders.push({ side: BUY, price: 100 + k, qty: 3 + k });
-      orders.push({ side: SELL, price: 96 + k, qty: 4 + k });
+      allOrders.push({ side: BUY, price: 100 + k, qty: 3 + k });
+      allOrders.push({ side: SELL, price: 96 + k, qty: 4 + k });
     }
+    const orders = allOrders.slice(0, Number(process.env.BENCH_ORDERS ?? 4));
+    // Deposit for each order; the last extra buy is underfunded and must be refunded untouched.
+    const deposits = orders.map((o) =>
+      o.side === BUY ? { base: 0, quote: o.qty * o.price } : { base: o.qty * LOT_SIZE, quote: 0 },
+    );
+    if (orders.length < N) {
+      orders.push({ side: BUY, price: 109, qty: 20 });
+      deposits.push({ base: 0, quote: 20 * 109 - 1 });
+    }
+    const covered = orders.map((o, i) =>
+      (o.side === BUY ? o.qty * o.price <= deposits[i].quote : o.qty * LOT_SIZE <= deposits[i].base)
+        ? o
+        : { ...o, qty: 0 },
+    );
     const bandLo = 95;
     const bandHi = 110;
+
+    const baseMint = await createMint(provider.connection, owner, owner.publicKey, null, 0);
+    const quoteMint = await createMint(provider.connection, owner, owner.publicKey, null, 0);
+    const traders = orders.map(() => anchor.web3.Keypair.generate());
+    const wallets: { base: PublicKey; quote: PublicKey }[] = [];
+    for (const [i, trader] of traders.entries()) {
+      await provider.sendAndConfirm(
+        new anchor.web3.Transaction().add(
+          anchor.web3.SystemProgram.transfer({
+            fromPubkey: owner.publicKey,
+            toPubkey: trader.publicKey,
+            lamports: 0.05 * anchor.web3.LAMPORTS_PER_SOL,
+          }),
+        ),
+      );
+      const base = await createAccount(provider.connection, owner, baseMint, trader.publicKey);
+      const quote = await createAccount(provider.connection, owner, quoteMint, trader.publicKey);
+      if (deposits[i].base > 0) await mintTo(provider.connection, owner, baseMint, base, owner, deposits[i].base);
+      if (deposits[i].quote > 0) await mintTo(provider.connection, owner, quoteMint, quote, owner, deposits[i].quote);
+      wallets.push({ base, quote });
+    }
 
     const bookId = new anchor.BN(randomBytes(8), "hex");
     const [bookPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("book"), owner.publicKey.toBuffer(), bookId.toArrayLike(Buffer, "le", 8)],
+      program.programId,
+    );
+    const [baseVault] = PublicKey.findProgramAddressSync(
+      [Buffer.from("vault"), bookPda.toBuffer(), baseMint.toBuffer()],
+      program.programId,
+    );
+    const [quoteVault] = PublicKey.findProgramAddressSync(
+      [Buffer.from("vault"), bookPda.toBuffer(), quoteMint.toBuffer()],
       program.programId,
     );
     const timings: Record<string, number | number[]> = {};
@@ -116,18 +161,39 @@ describe("LatticeEquities", () => {
     let t = Date.now();
     const createOffset = new anchor.BN(randomBytes(8), "hex");
     await program.methods
-      .createBook(createOffset, bookId)
-      .accountsPartial({ authority: owner.publicKey, book: bookPda, ...queueAccounts(createOffset, "init_book") })
+      .createBook(createOffset, bookId, new anchor.BN(LOT_SIZE))
+      .accountsPartial({
+        authority: owner.publicKey,
+        book: bookPda,
+        baseMint,
+        quoteMint,
+        ...queueAccounts(createOffset, "init_book"),
+      })
       .rpc({ skipPreflight: true, commitment: "confirmed" });
     await finalize(createOffset);
     timings.create_book_ms = Date.now() - t;
     console.log(`create_book: ${timings.create_book_ms} ms`);
 
+    await program.methods
+      .openVaults()
+      .accountsPartial({ authority: owner.publicKey, book: bookPda, baseMint, quoteMint, baseVault, quoteVault })
+      .rpc({ commitment: "confirmed" })
+      .catch((e) => {
+        console.log("open_vaults failed:", e.message, e.logs ?? e.transactionLogs ?? "");
+        throw e;
+      });
+
+    const ticketPda = (n: number) =>
+      PublicKey.findProgramAddressSync(
+        [Buffer.from("ticket"), bookPda.toBuffer(), new anchor.BN(n).toArrayLike(Buffer, "le", 4)],
+        program.programId,
+      )[0];
     const orderMs: number[] = [];
     for (const [i, o] of orders.entries()) {
       const nonce = randomBytes(16);
       const ct = cipher.encrypt([BigInt(o.side), BigInt(o.price), BigInt(o.qty)], nonce);
       const offset = new anchor.BN(randomBytes(8), "hex");
+      const isBuy = deposits[i].quote > 0;
       t = Date.now();
       await program.methods
         .submitOrder(
@@ -137,17 +203,25 @@ describe("LatticeEquities", () => {
           Array.from(ct[2]),
           Array.from(publicKey),
           new anchor.BN(deserializeLE(nonce).toString()),
+          new anchor.BN(deposits[i].base),
+          new anchor.BN(deposits[i].quote),
         )
-        .accountsPartial({ trader: owner.publicKey, book: bookPda, ...queueAccounts(offset, "place_order") })
+        .accountsPartial({
+          trader: traders[i].publicKey,
+          book: bookPda,
+          ticket: ticketPda(i),
+          traderToken: isBuy ? wallets[i].quote : wallets[i].base,
+          vault: isBuy ? quoteVault : baseVault,
+          ...queueAccounts(offset, "place_order"),
+        })
+        .signers([traders[i]])
         .rpc({ skipPreflight: true, commitment: "confirmed" });
       await finalize(offset);
       orderMs.push(Date.now() - t);
       console.log(`place_order ${i + 1}/${orders.length}: ${orderMs[i]} ms`);
     }
     timings.place_order_ms = orderMs;
-
-    const book = await program.account.book.fetch(bookPda);
-    expect(book.orderCount).to.equal(orders.length);
+    expect((await program.account.book.fetch(bookPda)).orderCount).to.equal(orders.length);
 
     t = Date.now();
     const clearOffset = new anchor.BN(randomBytes(8), "hex");
@@ -160,7 +234,7 @@ describe("LatticeEquities", () => {
     console.log(`clear: ${timings.clear_ms} ms`);
 
     const cleared = await program.account.book.fetch(bookPda);
-    const expected = referenceClear(orders, bandLo, bandHi);
+    const expected = referenceClear(covered, bandLo, bandHi);
     const fills = cleared.fills.map((f: anchor.BN) => f.toNumber());
     console.log("clearing price", cleared.clearingPrice, "matched", cleared.matched.toNumber());
     console.log("fills", fills.join(","));
@@ -169,6 +243,43 @@ describe("LatticeEquities", () => {
     expect(cleared.matched.toNumber()).to.equal(expected.matched);
     expect(fills).to.deep.equal(expected.fills);
 
+    for (let i = 0; i < orders.length; i++) {
+      await program.methods
+        .settleOrder()
+        .accountsPartial({
+          book: bookPda,
+          ticket: ticketPda(i),
+          trader: traders[i].publicKey,
+          baseVault,
+          quoteVault,
+          traderBase: wallets[i].base,
+          traderQuote: wallets[i].quote,
+        })
+        .rpc({ commitment: "confirmed" });
+    }
+
+    const price = expected.price;
+    for (let i = 0; i < orders.length; i++) {
+      const f = expected.fills[i];
+      const base = Number((await getAccount(provider.connection, wallets[i].base)).amount);
+      const quote = Number((await getAccount(provider.connection, wallets[i].quote)).amount);
+      const want =
+        deposits[i].quote > 0
+          ? { base: f * LOT_SIZE, quote: deposits[i].quote - f * price }
+          : { base: deposits[i].base - f * LOT_SIZE, quote: f * price };
+      console.log(`settled ${i}: base ${base} quote ${quote}`);
+      expect({ base, quote }).to.deep.equal(want);
+    }
+    const underfunded = orders.length - 1;
+    if (orders.length <= N && deposits[underfunded].quote === 20 * 109 - 1) {
+      expect(expected.fills[underfunded]).to.equal(0);
+    }
+    for (let i = 0; i < orders.length; i++) {
+      expect(await provider.connection.getAccountInfo(ticketPda(i))).to.equal(null);
+    }
+    expect(Number((await getAccount(provider.connection, baseVault)).amount)).to.equal(0);
+    expect(Number((await getAccount(provider.connection, quoteVault)).amount)).to.equal(0);
+
     const avg = orderMs.reduce((a, b) => a + b, 0) / orderMs.length;
     console.log(
       `SUMMARY create=${timings.create_book_ms}ms order_avg=${Math.round(avg)}ms ` +
@@ -176,7 +287,7 @@ describe("LatticeEquities", () => {
     );
     fs.writeFileSync(
       `bench-${process.env.BENCH_LABEL ?? "run"}.json`,
-      JSON.stringify({ ...timings, order_avg_ms: avg, price: cleared.clearingPrice, matched: expected.matched }, null, 2),
+      JSON.stringify({ ...timings, order_avg_ms: avg, price, matched: expected.matched }, null, 2),
     );
   });
 
