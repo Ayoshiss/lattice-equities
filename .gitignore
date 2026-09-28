@@ -11,3 +11,6 @@ build/*
 !build/*.arcis
 encrypted-ixs/src/main.rs
 artifacts/
+
+# regenerated on every local test run
+tests/fixtures/

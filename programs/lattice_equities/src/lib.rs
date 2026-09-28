@@ -28,6 +28,11 @@ pub const STATUS_OPEN: u8 = 0;
 pub const STATUS_CLEARING: u8 = 1;
 pub const STATUS_CLEARED: u8 = 2;
 
+// Pyth pull-oracle price accounts (PriceUpdateV2), owned by the Pyth receiver.
+const PYTH_RECEIVER: Pubkey = pubkey!("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+const BPS: u64 = 10_000;
+
 pub const TICKET_PENDING: u8 = 0;
 pub const TICKET_LIVE: u8 = 1;
 pub const TICKET_FAILED: u8 = 2;
@@ -76,8 +81,13 @@ pub mod lattice_equities {
         computation_offset: u64,
         book_id: u64,
         lot_size: u64,
+        price_feed_id: [u8; 32],
+        max_price_age_secs: u32,
+        band_bps: u16,
     ) -> Result<()> {
         require!(lot_size > 0, ErrorCode::InvalidLotSize);
+        require!(band_bps > 0 && (band_bps as u64) < BPS, ErrorCode::InvalidBand);
+        require!(max_price_age_secs > 0, ErrorCode::InvalidBand);
         let book = &mut ctx.accounts.book;
         book.bump = ctx.bumps.book;
         book.authority = ctx.accounts.authority.key();
@@ -85,6 +95,11 @@ pub mod lattice_equities {
         book.base_mint = ctx.accounts.base_mint.key();
         book.quote_mint = ctx.accounts.quote_mint.key();
         book.lot_size = lot_size;
+        book.base_decimals = ctx.accounts.base_mint.decimals;
+        book.quote_decimals = ctx.accounts.quote_mint.decimals;
+        book.price_feed_id = price_feed_id;
+        book.max_price_age_secs = max_price_age_secs;
+        book.band_bps = band_bps;
         book.order_count = 0;
         book.status = STATUS_OPEN;
         book.pending = true;
@@ -243,16 +258,27 @@ pub mod lattice_equities {
     }
 
     /// Queues `clear` with the Pyth-derived band. The band is public; the book is not.
-    pub fn clear_batch(
-        ctx: Context<ClearBatch>,
-        computation_offset: u64,
-        band_lo: u32,
-        band_hi: u32,
-    ) -> Result<()> {
+    pub fn clear_batch(ctx: Context<ClearBatch>, computation_offset: u64) -> Result<()> {
+        require_keys_eq!(*ctx.accounts.price_update.owner, PYTH_RECEIVER, ErrorCode::BadPriceAccount);
+        let quote = read_price_update(&ctx.accounts.price_update.try_borrow_data()?)?;
         let book = &mut ctx.accounts.book;
         require!(book.status == STATUS_OPEN, ErrorCode::BookNotOpen);
         require!(!book.pending, ErrorCode::ComputationPending);
-        require!(band_lo <= band_hi, ErrorCode::InvalidBand);
+        require!(quote.feed_id == book.price_feed_id, ErrorCode::WrongPriceFeed);
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now.saturating_sub(quote.publish_time) <= book.max_price_age_secs as i64,
+            ErrorCode::StalePrice
+        );
+        let (band_lo, band_hi) = price_band(
+            &quote,
+            book.lot_size,
+            book.base_decimals,
+            book.quote_decimals,
+            book.band_bps,
+        )?;
+        book.band_lo = band_lo;
+        book.band_hi = band_hi;
         book.status = STATUS_CLEARING;
         book.pending = true;
 
@@ -304,6 +330,8 @@ pub mod lattice_equities {
         book.pending = false;
         emit!(BatchClearedEvent {
             book: book.key(),
+            band_lo: book.band_lo,
+            band_hi: book.band_hi,
             clearing_price: book.clearing_price,
             matched: book.matched,
             fills: book.fills,
@@ -409,6 +437,63 @@ pub mod lattice_equities {
     }
 }
 
+pub struct PythPrice {
+    pub feed_id: [u8; 32],
+    pub price: i64,
+    pub conf: u64,
+    pub exponent: i32,
+    pub publish_time: i64,
+}
+
+/// Reads a Pyth PriceUpdateV2 account. Only fully verified updates are accepted.
+/// Layout: discriminator(8) write_authority(32) verification_level(1, Full)
+/// feed_id(32) price(i64) conf(u64) exponent(i32) publish_time(i64) ...
+pub fn read_price_update(data: &[u8]) -> Result<PythPrice> {
+    require!(data.len() >= 101, ErrorCode::BadPriceAccount);
+    require!(data[..8] == PRICE_UPDATE_V2_DISCRIMINATOR, ErrorCode::BadPriceAccount);
+    // Borsh enum tag: 0 = Partial { num_signatures }, 1 = Full.
+    require!(data[40] == 1, ErrorCode::PriceNotFullyVerified);
+    let le8 = |at: usize| <[u8; 8]>::try_from(&data[at..at + 8]).unwrap();
+    Ok(PythPrice {
+        feed_id: data[41..73].try_into().unwrap(),
+        price: i64::from_le_bytes(le8(73)),
+        conf: u64::from_le_bytes(le8(81)),
+        exponent: i32::from_le_bytes(data[89..93].try_into().unwrap()),
+        publish_time: i64::from_le_bytes(le8(93)),
+    })
+}
+
+/// Converts the Pyth price to quote atoms per lot and widens it by band_bps.
+/// Rejects the price when Pyth's own confidence interval is wider than the band.
+pub fn price_band(
+    p: &PythPrice,
+    lot_size: u64,
+    base_decimals: u8,
+    quote_decimals: u8,
+    band_bps: u16,
+) -> Result<(u32, u32)> {
+    require!(p.price > 0, ErrorCode::BadPriceAccount);
+    let price = p.price as u128;
+    require!(
+        (p.conf as u128) * (BPS as u128) <= price * band_bps as u128,
+        ErrorCode::PriceTooUncertain
+    );
+    // quote atoms per lot = price * 10^exponent * lot_size / 10^base_dec * 10^quote_dec
+    let scale = quote_decimals as i32 + p.exponent - base_decimals as i32;
+    require!(scale.abs() <= 30, ErrorCode::PriceOutOfRange);
+    let mut per_lot = price.checked_mul(lot_size as u128).ok_or(ErrorCode::PriceOutOfRange)?;
+    let pow = 10u128.pow(scale.unsigned_abs());
+    per_lot = if scale >= 0 {
+        per_lot.checked_mul(pow).ok_or(ErrorCode::PriceOutOfRange)?
+    } else {
+        per_lot / pow
+    };
+    let lo = per_lot * (BPS - band_bps as u64) as u128 / BPS as u128;
+    let hi = (per_lot * (BPS + band_bps as u64) as u128).div_ceil(BPS as u128);
+    require!(lo > 0 && hi <= u32::MAX as u128, ErrorCode::PriceOutOfRange);
+    Ok((lo as u32, hi as u32))
+}
+
 /// One per order. Holds the public side of the order (who, and what they
 /// deposited) and which encrypted-book slot it landed in.
 #[account]
@@ -442,6 +527,13 @@ pub struct Book {
     pub quote_vault: Pubkey,
     pub lot_size: u64,
     pub next_ticket: u32,
+    pub base_decimals: u8,
+    pub quote_decimals: u8,
+    pub price_feed_id: [u8; 32],
+    pub max_price_age_secs: u32,
+    pub band_bps: u16,
+    pub band_lo: u32,
+    pub band_hi: u32,
 }
 
 #[derive(Accounts)]
@@ -660,6 +752,8 @@ pub struct ClearBatch<'info> {
     pub caller: Signer<'info>,
     #[account(mut, constraint = book.authority == caller.key() @ ErrorCode::Unauthorized)]
     pub book: Box<Account<'info, Book>>,
+    /// CHECK: owner, discriminator, verification level and feed are checked in the handler.
+    pub price_update: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
         space = 9,
@@ -785,6 +879,8 @@ pub struct OrderPlacedEvent {
 #[event]
 pub struct BatchClearedEvent {
     pub book: Pubkey,
+    pub band_lo: u32,
+    pub band_hi: u32,
     pub clearing_price: u32,
     pub matched: u64,
     pub fills: [u64; MAX_ORDERS as usize],
@@ -842,5 +938,75 @@ pub enum ErrorCode {
     WrongTrader,
     #[msg("Arithmetic overflow")]
     Overflow,
+    #[msg("Not a Pyth price update account")]
+    BadPriceAccount,
+    #[msg("Pyth price update is not fully verified")]
+    PriceNotFullyVerified,
+    #[msg("Price update is for a different feed than this book")]
+    WrongPriceFeed,
+    #[msg("Reference price is too old")]
+    StalePrice,
+    #[msg("Pyth confidence interval is wider than the price band")]
+    PriceTooUncertain,
+    #[msg("Reference price does not fit the book's price units")]
+    PriceOutOfRange,
 
+}
+
+#[cfg(test)]
+mod price_tests {
+    use super::*;
+
+    fn account(level: u8, feed: [u8; 32], price: i64, conf: u64, exponent: i32, publish: i64) -> Vec<u8> {
+        let mut d = PRICE_UPDATE_V2_DISCRIMINATOR.to_vec();
+        d.extend_from_slice(&[7u8; 32]);
+        d.push(level);
+        if level == 0 {
+            d.push(5);
+        }
+        d.extend_from_slice(&feed);
+        d.extend_from_slice(&price.to_le_bytes());
+        d.extend_from_slice(&conf.to_le_bytes());
+        d.extend_from_slice(&exponent.to_le_bytes());
+        d.extend_from_slice(&publish.to_le_bytes());
+        d.extend_from_slice(&[0u8; 32]);
+        d
+    }
+
+    #[test]
+    fn reads_a_full_update() {
+        let p = read_price_update(&account(1, [9; 32], 25_512_345, 1_000, -5, 1_700_000_000)).unwrap();
+        assert_eq!(p.feed_id, [9; 32]);
+        assert_eq!((p.price, p.conf, p.exponent, p.publish_time), (25_512_345, 1_000, -5, 1_700_000_000));
+    }
+
+    #[test]
+    fn rejects_partial_updates_and_wrong_accounts() {
+        assert!(read_price_update(&account(0, [9; 32], 1, 0, -5, 0)).is_err());
+        let mut bad = account(1, [9; 32], 1, 0, -5, 0);
+        bad[0] ^= 1;
+        assert!(read_price_update(&bad).is_err());
+        assert!(read_price_update(&[0u8; 50]).is_err());
+    }
+
+    fn price(price: i64, conf: u64, exponent: i32) -> PythPrice {
+        PythPrice { feed_id: [0; 32], price, conf, exponent, publish_time: 0 }
+    }
+
+    #[test]
+    fn converts_to_quote_atoms_per_lot() {
+        // $255.12345 per share, 1 share lots (base 8 decimals), USDC quote (6 decimals).
+        let (lo, hi) = price_band(&price(25_512_345, 1_000, -5), 100_000_000, 8, 6, 200).unwrap();
+        assert_eq!((lo, hi), (250_020_981, 260_225_919));
+        // $10.00000 per share, 10-atom lots, 0-decimal tokens.
+        assert_eq!(price_band(&price(1_000_000, 10, -5), 10, 0, 0, 1_000).unwrap(), (90, 110));
+    }
+
+    #[test]
+    fn rejects_uncertain_or_unrepresentable_prices() {
+        assert!(price_band(&price(1_000_000, 200_000, -5), 10, 0, 0, 1_000).is_err());
+        assert!(price_band(&price(-5, 0, -5), 10, 0, 0, 1_000).is_err());
+        assert!(price_band(&price(1, 0, -5), 10, 0, 0, 1_000).is_err());
+        assert!(price_band(&price(i64::MAX, 0, 0), u64::MAX, 0, 18, 100).is_err());
+    }
 }

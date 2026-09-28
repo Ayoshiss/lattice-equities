@@ -30,6 +30,12 @@ import { createMint, createAccount, mintTo, getAccount } from "@solana/spl-token
 
 const N = 16;
 const LOT_SIZE = 10;
+const AAPLX_USD = "978e6cc68a119ce066aa830017318563a9ed04ec3a0a6439010fc11296a58675";
+const AAPL_EQUITY = "49f6b65cb1de6b10eaf75e7c03ca029c306d0357e91b5311b175084a5ad55688";
+// Local stand-ins for Pyth price updates, written by scripts/pyth-fixtures.cjs.
+const PYTH_FRESH = new PublicKey("H1PFU9pRg879bM4TBUsr11igtAdt1xU7zHL673jg8hsJ");
+const PYTH_STALE = new PublicKey("FDWVP2C1f7iYugmnYCdBE91Gw91wQsboiQ2ET2V9c5JQ");
+const feedBytes = (hex: string) => Array.from(Buffer.from(hex, "hex"));
 const BUY = 1;
 const SELL = 0;
 type Order = { side: number; price: number; qty: number };
@@ -119,7 +125,8 @@ describe("LatticeEquities", () => {
         ? o
         : { ...o, qty: 0 },
     );
-    const bandLo = 95;
+    // Fixture price is $10.00000; 10-atom lots at 0 decimals = 100 per lot, band 10%.
+    const bandLo = 90;
     const bandHi = 110;
 
     const baseMint = await createMint(provider.connection, owner, owner.publicKey, null, 0);
@@ -161,7 +168,7 @@ describe("LatticeEquities", () => {
     let t = Date.now();
     const createOffset = new anchor.BN(randomBytes(8), "hex");
     await program.methods
-      .createBook(createOffset, bookId, new anchor.BN(LOT_SIZE))
+      .createBook(createOffset, bookId, new anchor.BN(LOT_SIZE), feedBytes(AAPLX_USD), 600, 1_000)
       .accountsPartial({
         authority: owner.publicKey,
         book: bookPda,
@@ -226,8 +233,13 @@ describe("LatticeEquities", () => {
     t = Date.now();
     const clearOffset = new anchor.BN(randomBytes(8), "hex");
     await program.methods
-      .clearBatch(clearOffset, bandLo, bandHi)
-      .accountsPartial({ caller: owner.publicKey, book: bookPda, ...queueAccounts(clearOffset, "clear") })
+      .clearBatch(clearOffset)
+      .accountsPartial({
+        caller: owner.publicKey,
+        book: bookPda,
+        priceUpdate: PYTH_FRESH,
+        ...queueAccounts(clearOffset, "clear"),
+      })
       .rpc({ skipPreflight: true, commitment: "confirmed" });
     await finalize(clearOffset);
     timings.clear_ms = Date.now() - t;
@@ -239,6 +251,7 @@ describe("LatticeEquities", () => {
     console.log("clearing price", cleared.clearingPrice, "matched", cleared.matched.toNumber());
     console.log("fills", fills.join(","));
     expect(cleared.status).to.equal(2);
+    expect([cleared.bandLo, cleared.bandHi]).to.deep.equal([bandLo, bandHi]);
     expect(cleared.clearingPrice).to.equal(expected.price);
     expect(cleared.matched.toNumber()).to.equal(expected.matched);
     expect(fills).to.deep.equal(expected.fills);
@@ -289,6 +302,43 @@ describe("LatticeEquities", () => {
       `bench-${process.env.BENCH_LABEL ?? "run"}.json`,
       JSON.stringify({ ...timings, order_avg_ms: avg, price, matched: expected.matched }, null, 2),
     );
+  });
+
+  it("refuses to clear on a stale price or another stock's feed", async () => {
+    const baseMint = await createMint(provider.connection, owner, owner.publicKey, null, 0);
+    const quoteMint = await createMint(provider.connection, owner, owner.publicKey, null, 0);
+    const openBook = async (feed: string) => {
+      const bookId = new anchor.BN(randomBytes(8), "hex");
+      const [book] = PublicKey.findProgramAddressSync(
+        [Buffer.from("book"), owner.publicKey.toBuffer(), bookId.toArrayLike(Buffer, "le", 8)],
+        program.programId,
+      );
+      const offset = new anchor.BN(randomBytes(8), "hex");
+      await program.methods
+        .createBook(offset, bookId, new anchor.BN(LOT_SIZE), feedBytes(feed), 600, 1_000)
+        .accountsPartial({ authority: owner.publicKey, book, baseMint, quoteMint, ...queueAccounts(offset, "init_book") })
+        .rpc({ skipPreflight: true, commitment: "confirmed" });
+      await finalize(offset);
+      return book;
+    };
+    const clearWith = async (book: PublicKey, priceUpdate: PublicKey) => {
+      const offset = new anchor.BN(randomBytes(8), "hex");
+      try {
+        await program.methods
+          .clearBatch(offset)
+          .accountsPartial({ caller: owner.publicKey, book, priceUpdate, ...queueAccounts(offset, "clear") })
+          .rpc({ commitment: "confirmed" });
+        return "cleared";
+      } catch (e) {
+        return String(e.error?.errorCode?.code ?? e.message);
+      }
+    };
+
+    const aaplx = await openBook(AAPLX_USD);
+    expect(await clearWith(aaplx, PYTH_STALE)).to.equal("StalePrice");
+    const equity = await openBook(AAPL_EQUITY);
+    expect(await clearWith(equity, PYTH_FRESH)).to.equal("WrongPriceFeed");
+    expect(await clearWith(aaplx, owner.publicKey)).to.equal("BadPriceAccount");
   });
 
   async function initCompDef(circuit: string) {

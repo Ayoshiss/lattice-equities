@@ -17,7 +17,8 @@ encrypted.
 ## How it works
 
 1. **Open a book.** `create_book` creates a `Book` for a base token (the stock)
-   and a quote token, with a lot size. Arcium writes an empty order book into
+   and a quote token, with a lot size, a Pyth price feed, a maximum price age
+   and a band width. Arcium writes an empty order book into
    it, encrypted to the MXE. The key is split across Arcium's nodes, so no
    single node can decrypt it. `open_vaults` creates the book's token vaults.
 2. **Submit orders.** The trader encrypts side, limit price and quantity on
@@ -25,9 +26,10 @@ encrypted.
    buy, whole lots of base for a sell. The deposit goes to the vault and an
    `OrderTicket` account records it. Arcium checks inside the computation that
    the deposit covers the order, then adds it to the encrypted book.
-3. **Clear.** `clear_batch` passes the book and a public price band to Arcium.
-   The nodes compute the clearing price and each order's fill without
-   decrypting anything, then reveal only the result.
+3. **Clear.** `clear_batch` reads the book's Pyth price and sets the band from
+   it, then passes the book and band to Arcium. The nodes compute the clearing
+   price and each order's fill without decrypting anything, then reveal only
+   the result.
 4. **Settle.** `settle_order` pays out one ticket and closes it. A buyer gets
    base lots plus any unspent quote; a seller gets quote plus any unsold base.
    Anyone can call it, but tokens only go to the ticket's trader.
@@ -51,6 +53,22 @@ the book so it can be cleared again.
   quantity in lots for a sell) is kept at zero quantity inside the computation.
   It never fills and is refunded in full, and nothing about it is revealed.
 
+### Reference price
+
+The band comes from a [Pyth](https://pyth.network) price update, and the batch
+does not clear unless the update:
+
+- is a fully verified Pyth account (owner and account type are checked)
+- is for the feed the book was created with
+- is no older than the book's maximum age
+- has a confidence interval narrower than the band
+
+The price is converted to quote units per lot and widened by the band width.
+The band used is stored on the book and emitted with the result. For stocks
+that trade around the clock, such as xStocks, use the token's 24/7 feed (for
+example `Crypto.AAPLX/USD`) rather than the exchange feed, which goes stale
+outside market hours.
+
 ### What is revealed
 
 | Revealed | Stays encrypted |
@@ -73,6 +91,7 @@ do not fill.
 | `tests/lattice_equities.ts` | End-to-end batch with real token deposits and settlement, checked against a plain TypeScript implementation |
 | `circuits/` | Published circuits, named `<circuit>-<first 8 hex of SHA-256>.arcis`. Arcium nodes fetch them from here |
 | `scripts/publish-circuits.sh` | Copies fresh builds into `circuits/`. Existing files are never overwritten |
+| `scripts/pyth-fixtures.cjs` | Writes stand-in Pyth price accounts (fresh and stale) for the local test network |
 
 A book holds 16 orders. It is stored packed as 9 ciphertexts so each update fits
 in one Solana transaction. One order is processed at a time, so every update
@@ -96,19 +115,25 @@ Deployed builds fetch circuits from `circuits/` on GitHub. For local tests,
 build the program with `local-circuits` so the local network uses the circuits
 from your own build instead:
 
+Pyth does not run locally, so generate stand-in price accounts first. They
+are loaded through `Anchor.toml`.
+
 ```bash
 arcium build --skip-program
 anchor build -- --features local-circuits
+node scripts/pyth-fixtures.cjs
 arcium test --skip-build
 ```
 
 Rebuild without the feature before deploying.
 
-Unit tests for the clearing logic run as plain Rust, including a check that the
-circuit matches a simple reference implementation on 20,000 random books:
+Unit tests run as plain Rust: the clearing logic, including a check against a
+simple reference implementation on 20,000 random books, and the Pyth price
+parsing and conversion:
 
 ```bash
 cargo test -p encrypted-ixs clearing_tests
+cargo test -p lattice_equities price_tests
 ```
 
 On Apple Silicon the circuit compiler can abort on a debug assertion. Disable
