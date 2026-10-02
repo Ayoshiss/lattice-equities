@@ -40,7 +40,7 @@ mod circuits {
     }
 
     #[instruction]
-    pub fn place_order(
+    pub fn place_order_v2(
         order_ctxt: Enc<Shared, Order>,
         book_ctxt: Enc<Mxe, PackedBook>,
         base_deposit: u64,
@@ -63,9 +63,10 @@ mod circuits {
     }
 
     #[instruction]
-    pub fn clear(book_ctxt: Enc<Mxe, PackedBook>, band_lo: u32, band_hi: u32) -> ClearResult {
+    pub fn clear_v2(book_ctxt: Enc<Mxe, PackedBook>, band_lo: u32, band_hi: u32, cancelled: u32) -> ClearResult {
         let book = book_ctxt.to_arcis().unpack();
-        let (price, matched, fills) = clear_book(book.sides, book.prices, book.qtys, band_lo, band_hi);
+        let qtys = drop_cancelled(book.qtys, cancelled);
+        let (price, matched, fills) = clear_book(book.sides, book.prices, qtys, band_lo, band_hi);
         ClearResult { price, matched, fills }.reveal()
     }
 
@@ -80,6 +81,18 @@ mod circuits {
             quote_deposit == 0 && qty <= base_deposit
         };
         if ok { qty } else { 0 }
+    }
+
+    // Cancelled orders stay in the encrypted book; bit i of the public mask marks
+    // slot i cancelled, and a zero quantity means it can never fill.
+    pub fn drop_cancelled(qtys: [u64; N], cancelled: u32) -> [u64; N] {
+        let mut out = qtys;
+        for i in 0..N {
+            if (cancelled >> i) & 1 == 1 {
+                out[i] = 0;
+            }
+        }
+        out
     }
 
     fn better_of(v1: u64, p1: u32, v2: u64, p2: u32) -> (u64, u32) {
@@ -174,7 +187,19 @@ mod circuits {
 
 #[cfg(test)]
 mod clearing_tests {
-    use super::circuits::{clear_book, covered_qty, N};
+    use super::circuits::{clear_book, covered_qty, drop_cancelled, N};
+
+    #[test]
+    fn cancelled_slots_have_no_size() {
+        let mut q = [0u64; N];
+        for i in 0..N {
+            q[i] = i as u64 + 1;
+        }
+        let out = drop_cancelled(q, 0b1000_0000_0000_0101);
+        assert_eq!((out[0], out[1], out[2], out[15]), (0, 2, 0, 0));
+        assert_eq!(out.iter().filter(|&&x| x == 0).count(), 3);
+        assert_eq!(drop_cancelled(q, 0), q);
+    }
 
     #[test]
     fn deposits_must_cover_the_order() {

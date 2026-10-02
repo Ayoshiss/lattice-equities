@@ -16,8 +16,8 @@ use arcium_macros::circuit_hash;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 const COMP_DEF_OFFSET_INIT_BOOK: u32 = comp_def_offset("init_book");
-const COMP_DEF_OFFSET_PLACE_ORDER: u32 = comp_def_offset("place_order");
-const COMP_DEF_OFFSET_CLEAR: u32 = comp_def_offset("clear");
+const COMP_DEF_OFFSET_PLACE_ORDER: u32 = comp_def_offset("place_order_v2");
+const COMP_DEF_OFFSET_CLEAR: u32 = comp_def_offset("clear_v2");
 
 pub const MAX_ORDERS: u8 = 16;
 const BOOK_CIPHERTEXTS: usize = 9;
@@ -27,9 +27,18 @@ const ENCRYPTED_BOOK_SIZE: u32 = 32 * BOOK_CIPHERTEXTS as u32;
 pub const STATUS_OPEN: u8 = 0;
 pub const STATUS_CLEARING: u8 = 1;
 pub const STATUS_CLEARED: u8 = 2;
+pub const STATUS_DEAD: u8 = 3;
+
+// What the book is waiting on while `pending` is set.
+pub const PENDING_INIT: u8 = 1;
+pub const PENDING_ORDER: u8 = 2;
+pub const PENDING_CLEAR: u8 = 3;
 
 // Pyth pull-oracle price accounts (PriceUpdateV2), owned by the Pyth receiver.
 const PYTH_RECEIVER: Pubkey = pubkey!("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+// Canonical per-feed price accounts are PDAs of the Pyth push oracle (shard 0).
+// Anyone can refresh them with a newer verified update, so their staleness is a fact.
+const PYTH_PUSH_ORACLE: Pubkey = pubkey!("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
 const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
 const BPS: u64 = 10_000;
 
@@ -40,7 +49,12 @@ pub const TICKET_FAILED: u8 = 2;
 // Circuits are too large to store on-chain cheaply, so Arx nodes fetch them from
 // the public repo and verify them against the SHA-256 embedded at build time.
 // Local tests build with `local-circuits`, where arcium pre-seeds them on-chain.
-const CIRCUIT_BASE_URL: &str = "https://raw.githubusercontent.com/Ayoshiss/lattice-equities/main/circuits/";
+// A build can point at another branch (e.g. for a devnet experiment) by setting
+// LATTICE_CIRCUIT_BASE_URL at compile time; the hash pin applies either way.
+const CIRCUIT_BASE_URL: &str = match option_env!("LATTICE_CIRCUIT_BASE_URL") {
+    Some(url) => url,
+    None => "https://raw.githubusercontent.com/Ayoshiss/lattice-equities/main/circuits/",
+};
 
 fn circuit_source(name: &str, hash: [u8; 32]) -> Option<CircuitSource> {
     if cfg!(feature = "local-circuits") {
@@ -66,13 +80,13 @@ pub mod lattice_equities {
         Ok(())
     }
 
-    pub fn init_place_order_comp_def(ctx: Context<InitPlaceOrderCompDef>) -> Result<()> {
-        init_computation_def(ctx.accounts, circuit_source("place_order", circuit_hash!("place_order")))?;
+    pub fn init_place_order_v2_comp_def(ctx: Context<InitPlaceOrderV2CompDef>) -> Result<()> {
+        init_computation_def(ctx.accounts, circuit_source("place_order_v2", circuit_hash!("place_order_v2")))?;
         Ok(())
     }
 
-    pub fn init_clear_comp_def(ctx: Context<InitClearCompDef>) -> Result<()> {
-        init_computation_def(ctx.accounts, circuit_source("clear", circuit_hash!("clear")))?;
+    pub fn init_clear_v2_comp_def(ctx: Context<InitClearV2CompDef>) -> Result<()> {
+        init_computation_def(ctx.accounts, circuit_source("clear_v2", circuit_hash!("clear_v2")))?;
         Ok(())
     }
 
@@ -84,10 +98,22 @@ pub mod lattice_equities {
         price_feed_id: [u8; 32],
         max_price_age_secs: u32,
         band_bps: u16,
+        pending_timeout_secs: u32,
+        fallback_feed_id: [u8; 32],
+        fallback_band_bps: u16,
+        market_closed_after_secs: u32,
     ) -> Result<()> {
         require!(lot_size > 0, ErrorCode::InvalidLotSize);
+        require!(pending_timeout_secs > 0, ErrorCode::InvalidTimeout);
         require!(band_bps > 0 && (band_bps as u64) < BPS, ErrorCode::InvalidBand);
         require!(max_price_age_secs > 0, ErrorCode::InvalidBand);
+        if fallback_feed_id != [0u8; 32] {
+            require!(
+                fallback_band_bps >= band_bps && (fallback_band_bps as u64) < BPS,
+                ErrorCode::InvalidFallback
+            );
+            require!(market_closed_after_secs > max_price_age_secs, ErrorCode::InvalidFallback);
+        }
         let book = &mut ctx.accounts.book;
         book.bump = ctx.bumps.book;
         book.authority = ctx.accounts.authority.key();
@@ -100,10 +126,16 @@ pub mod lattice_equities {
         book.price_feed_id = price_feed_id;
         book.max_price_age_secs = max_price_age_secs;
         book.band_bps = band_bps;
+        book.primary_price_account = canonical_price_account(&price_feed_id);
+        book.fallback_feed_id = fallback_feed_id;
+        book.fallback_band_bps = fallback_band_bps;
+        book.market_closed_after_secs = market_closed_after_secs;
+        book.last_order_at = Clock::get()?.unix_timestamp;
+        book.pending_timeout_secs = pending_timeout_secs;
         book.order_count = 0;
         book.status = STATUS_OPEN;
-        book.pending = true;
         book.encrypted_book = [[0u8; 32]; BOOK_CIPHERTEXTS];
+        start_pending(book, PENDING_INIT, ctx.accounts.computation_account.key(), Pubkey::default())?;
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
@@ -135,14 +167,21 @@ pub mod lattice_equities {
         ctx: Context<InitBookCallback>,
         output: SignedComputationOutputs<InitBookOutput>,
     ) -> Result<()> {
+        let book = &mut ctx.accounts.book;
+        if !is_current(book, &ctx.accounts.computation_account.key()) {
+            return Ok(());
+        }
         let o = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
             Ok(InitBookOutput { field_0 }) => field_0,
-            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
+            Err(_) => {
+                book.status = STATUS_DEAD;
+                end_pending(book);
+                return Ok(());
+            }
         };
-        let book = &mut ctx.accounts.book;
         book.encrypted_book = o.ciphertexts;
         book.state_nonce = o.nonce;
-        book.pending = false;
+        end_pending(book);
         emit!(BookReadyEvent { book: book.key() });
         Ok(())
     }
@@ -194,7 +233,7 @@ pub mod lattice_equities {
         ticket.quote_deposit = quote_deposit;
         book.next_ticket = book.next_ticket.checked_add(1).ok_or(ErrorCode::Overflow)?;
         let base_lots = base_deposit / book.lot_size;
-        book.pending = true;
+        start_pending(book, PENDING_ORDER, ctx.accounts.computation_account.key(), ctx.accounts.ticket.key())?;
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
@@ -215,7 +254,7 @@ pub mod lattice_equities {
             ctx.accounts,
             computation_offset,
             args,
-            vec![PlaceOrderCallback::callback_ix(
+            vec![PlaceOrderV2Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &[
@@ -230,20 +269,25 @@ pub mod lattice_equities {
         Ok(())
     }
 
-    #[arcium_callback(encrypted_ix = "place_order")]
-    pub fn place_order_callback(
-        ctx: Context<PlaceOrderCallback>,
-        output: SignedComputationOutputs<PlaceOrderOutput>,
+    #[arcium_callback(encrypted_ix = "place_order_v2")]
+    pub fn place_order_v2_callback(
+        ctx: Context<PlaceOrderV2Callback>,
+        output: SignedComputationOutputs<PlaceOrderV2Output>,
     ) -> Result<()> {
         let book = &mut ctx.accounts.book;
         let ticket = &mut ctx.accounts.ticket;
+        // A result for a computation the book already gave up on (expire_pending)
+        // must not touch the book: a newer order may be in flight.
+        if !is_current(book, &ctx.accounts.computation_account.key()) {
+            return Ok(());
+        }
         let o = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
-            Ok(PlaceOrderOutput { field_0 }) => field_0,
+            Ok(PlaceOrderV2Output { field_0 }) => field_0,
             Err(_) => {
                 // The order never reached the encrypted book. Unlock the book and let
                 // the trader take the deposit back with refund_failed_order.
                 ticket.status = TICKET_FAILED;
-                book.pending = false;
+                end_pending(book);
                 emit!(OrderFailedEvent { book: book.key(), trader: ticket.trader });
                 return Ok(());
             }
@@ -252,35 +296,44 @@ pub mod lattice_equities {
         book.encrypted_book = o.ciphertexts;
         book.state_nonce = o.nonce;
         book.order_count += 1;
-        book.pending = false;
+        book.last_order_at = Clock::get()?.unix_timestamp;
+        end_pending(book);
         emit!(OrderPlacedEvent { book: book.key(), order_count: book.order_count });
         Ok(())
     }
 
     /// Queues `clear` with the Pyth-derived band. The band is public; the book is not.
     pub fn clear_batch(ctx: Context<ClearBatch>, computation_offset: u64) -> Result<()> {
-        require_keys_eq!(*ctx.accounts.price_update.owner, PYTH_RECEIVER, ErrorCode::BadPriceAccount);
-        let quote = read_price_update(&ctx.accounts.price_update.try_borrow_data()?)?;
+        require_keys_eq!(
+            ctx.accounts.price_update.key(),
+            ctx.accounts.book.primary_price_account,
+            ErrorCode::WrongPriceAccount
+        );
+        let primary = read_pyth_account(&ctx.accounts.price_update)?;
+        let fallback = match &ctx.accounts.fallback_update {
+            Some(acc) => Some(read_pyth_account(acc)?),
+            None => None,
+        };
         let book = &mut ctx.accounts.book;
         require!(book.status == STATUS_OPEN, ErrorCode::BookNotOpen);
         require!(!book.pending, ErrorCode::ComputationPending);
-        require!(quote.feed_id == book.price_feed_id, ErrorCode::WrongPriceFeed);
-        let now = Clock::get()?.unix_timestamp;
-        require!(
-            now.saturating_sub(quote.publish_time) <= book.max_price_age_secs as i64,
-            ErrorCode::StalePrice
-        );
-        let (band_lo, band_hi) = price_band(
-            &quote,
-            book.lot_size,
-            book.base_decimals,
-            book.quote_decimals,
-            book.band_bps,
-        )?;
+        let rules = PriceRules {
+            primary_feed: book.price_feed_id,
+            fallback_feed: book.fallback_feed_id,
+            max_age: book.max_price_age_secs as i64,
+            closed_after: book.market_closed_after_secs as i64,
+            cutoff: book.last_order_at,
+            band_bps: book.band_bps,
+            fallback_band_bps: book.fallback_band_bps,
+        };
+        let (quote, band_bps, used_fallback) =
+            select_reference(Clock::get()?.unix_timestamp, &rules, &primary, fallback.as_ref())?;
+        let (band_lo, band_hi) = price_band(quote, book.lot_size, book.base_decimals, book.quote_decimals, band_bps)?;
         book.band_lo = band_lo;
         book.band_hi = band_hi;
+        book.used_fallback = used_fallback;
         book.status = STATUS_CLEARING;
-        book.pending = true;
+        start_pending(book, PENDING_CLEAR, ctx.accounts.computation_account.key(), Pubkey::default())?;
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
@@ -289,13 +342,14 @@ pub mod lattice_equities {
             .account(book.key(), ENCRYPTED_BOOK_OFFSET, ENCRYPTED_BOOK_SIZE)
             .plaintext_u32(band_lo)
             .plaintext_u32(band_hi)
+            .plaintext_u32(book.cancelled_mask)
             .build();
 
         queue_computation(
             ctx.accounts,
             computation_offset,
             args,
-            vec![ClearCallback::callback_ix(
+            vec![ClearV2Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &[CallbackAccount { pubkey: ctx.accounts.book.key(), is_writable: true }],
@@ -307,18 +361,21 @@ pub mod lattice_equities {
         Ok(())
     }
 
-    #[arcium_callback(encrypted_ix = "clear")]
-    pub fn clear_callback(
-        ctx: Context<ClearCallback>,
-        output: SignedComputationOutputs<ClearOutput>,
+    #[arcium_callback(encrypted_ix = "clear_v2")]
+    pub fn clear_v2_callback(
+        ctx: Context<ClearV2Callback>,
+        output: SignedComputationOutputs<ClearV2Output>,
     ) -> Result<()> {
         let book = &mut ctx.accounts.book;
+        if !is_current(book, &ctx.accounts.computation_account.key()) {
+            return Ok(());
+        }
         let r = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
-            Ok(ClearOutput { field_0 }) => field_0,
+            Ok(ClearV2Output { field_0 }) => field_0,
             Err(_) => {
                 // Reopen so the authority can retry the clear.
                 book.status = STATUS_OPEN;
-                book.pending = false;
+                end_pending(book);
                 emit!(ClearFailedEvent { book: book.key() });
                 return Ok(());
             }
@@ -327,11 +384,12 @@ pub mod lattice_equities {
         book.matched = r.field_1;
         book.fills = r.field_2;
         book.status = STATUS_CLEARED;
-        book.pending = false;
+        end_pending(book);
         emit!(BatchClearedEvent {
             book: book.key(),
             band_lo: book.band_lo,
             band_hi: book.band_hi,
+            used_fallback: book.used_fallback,
             clearing_price: book.clearing_price,
             matched: book.matched,
             fills: book.fills,
@@ -353,23 +411,69 @@ pub mod lattice_equities {
         };
         require_keys_eq!(ctx.accounts.vault.key(), vault, ErrorCode::WrongVault);
         require_keys_eq!(ctx.accounts.trader_token.mint, mint, ErrorCode::WrongTrader);
+        pay_from_vault(
+            book,
+            ctx.accounts.book.to_account_info(),
+            ctx.accounts.token_program.key(),
+            ctx.accounts.vault.to_account_info(),
+            ctx.accounts.trader_token.to_account_info(),
+            amount,
+        )
+    }
 
-        let authority = book.authority;
-        let book_id = book.book_id.to_le_bytes();
-        let bump = [book.bump];
-        let seeds: &[&[u8]] = &[b"book", authority.as_ref(), &book_id, &bump];
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.key(),
-                Transfer {
-                    from: ctx.accounts.vault.to_account_info(),
-                    to: ctx.accounts.trader_token.to_account_info(),
-                    authority: ctx.accounts.book.to_account_info(),
-                },
-                &[seeds],
-            ),
+    /// Releases a book stuck waiting on a computation that never returned. Anyone
+    /// can call it once the book's timeout has passed: a stuck order becomes
+    /// refundable, a stuck clear reopens the book, a stuck setup marks it dead.
+    pub fn expire_pending(ctx: Context<ExpirePending>) -> Result<()> {
+        let book = &mut ctx.accounts.book;
+        require!(book.pending, ErrorCode::NothingPending);
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now.saturating_sub(book.pending_since) >= book.pending_timeout_secs as i64,
+            ErrorCode::TimeoutNotReached
+        );
+        match book.pending_kind {
+            PENDING_ORDER => {
+                let ticket = ctx.accounts.ticket.as_mut().ok_or(ErrorCode::WrongTicket)?;
+                require_keys_eq!(ticket.key(), book.pending_ticket, ErrorCode::WrongTicket);
+                ticket.status = TICKET_FAILED;
+            }
+            PENDING_CLEAR => book.status = STATUS_OPEN,
+            _ => book.status = STATUS_DEAD,
+        }
+        emit!(PendingExpiredEvent { book: book.key(), kind: book.pending_kind });
+        end_pending(book);
+        Ok(())
+    }
+
+    /// Pulls a live order out before the clear and refunds its deposit. The order
+    /// stays in the encrypted book, but its slot is marked cancelled, and the clear
+    /// treats cancelled slots as size zero, so it can never fill.
+    pub fn cancel_order(ctx: Context<CancelOrder>) -> Result<()> {
+        let book = &ctx.accounts.book;
+        let ticket = &ctx.accounts.ticket;
+        require!(book.status == STATUS_OPEN, ErrorCode::BookNotOpen);
+        require!(ticket.status == TICKET_LIVE, ErrorCode::NothingToSettle);
+        require_keys_eq!(ctx.accounts.trader_token.owner, ticket.trader, ErrorCode::WrongTrader);
+        let (amount, vault, mint) = if ticket.quote_deposit > 0 {
+            (ticket.quote_deposit, book.quote_vault, book.quote_mint)
+        } else {
+            (ticket.base_deposit, book.base_vault, book.base_mint)
+        };
+        require_keys_eq!(ctx.accounts.vault.key(), vault, ErrorCode::WrongVault);
+        require_keys_eq!(ctx.accounts.trader_token.mint, mint, ErrorCode::WrongTrader);
+        pay_from_vault(
+            book,
+            ctx.accounts.book.to_account_info(),
+            ctx.accounts.token_program.key(),
+            ctx.accounts.vault.to_account_info(),
+            ctx.accounts.trader_token.to_account_info(),
             amount,
         )?;
+        let slot = ticket.slot;
+        let book = &mut ctx.accounts.book;
+        book.cancelled_mask |= 1u32 << slot;
+        emit!(OrderCancelledEvent { book: book.key(), slot, trader: ctx.accounts.trader.key() });
         Ok(())
     }
 
@@ -437,6 +541,43 @@ pub mod lattice_equities {
     }
 }
 
+fn start_pending(book: &mut Book, kind: u8, computation: Pubkey, ticket: Pubkey) -> Result<()> {
+    book.pending = true;
+    book.pending_kind = kind;
+    book.pending_since = Clock::get()?.unix_timestamp;
+    book.pending_computation = computation;
+    book.pending_ticket = ticket;
+    Ok(())
+}
+
+fn end_pending(book: &mut Book) {
+    book.pending = false;
+    book.pending_kind = 0;
+    book.pending_computation = Pubkey::default();
+    book.pending_ticket = Pubkey::default();
+}
+
+fn is_current(book: &Book, computation: &Pubkey) -> bool {
+    book.pending && book.pending_computation == *computation
+}
+
+fn pay_from_vault<'info>(
+    book: &Book,
+    book_info: AccountInfo<'info>,
+    token_program: Pubkey,
+    from: AccountInfo<'info>,
+    to: AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    let book_id = book.book_id.to_le_bytes();
+    let bump = [book.bump];
+    let seeds: &[&[u8]] = &[b"book", book.authority.as_ref(), &book_id, &bump];
+    token::transfer(
+        CpiContext::new_with_signer(token_program, Transfer { from, to, authority: book_info }, &[seeds]),
+        amount,
+    )
+}
+
 pub struct PythPrice {
     pub feed_id: [u8; 32],
     pub price: i64,
@@ -494,6 +635,50 @@ pub fn price_band(
     Ok((lo as u32, hi as u32))
 }
 
+pub fn canonical_price_account(feed_id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[&0u16.to_le_bytes(), feed_id], &PYTH_PUSH_ORACLE).0
+}
+
+fn read_pyth_account(acc: &AccountInfo) -> Result<PythPrice> {
+    require_keys_eq!(*acc.owner, PYTH_RECEIVER, ErrorCode::BadPriceAccount);
+    read_price_update(&acc.try_borrow_data()?)
+}
+
+pub struct PriceRules {
+    pub primary_feed: [u8; 32],
+    pub fallback_feed: [u8; 32],
+    pub max_age: i64,
+    pub closed_after: i64,
+    pub cutoff: i64,
+    pub band_bps: u16,
+    pub fallback_band_bps: u16,
+}
+
+/// Picks the reference price for a clear. The exchange (primary) price is used
+/// whenever it is fresh. The 24/7 fallback is only allowed once the primary has
+/// been silent past `closed_after`, i.e. the exchange is closed. Either way the
+/// price must be published after the last order entered the book, so the book
+/// owner cannot hold back an older, friendlier update.
+pub fn select_reference<'a>(
+    now: i64,
+    r: &PriceRules,
+    primary: &'a PythPrice,
+    fallback: Option<&'a PythPrice>,
+) -> Result<(&'a PythPrice, u16, bool)> {
+    require!(primary.feed_id == r.primary_feed, ErrorCode::WrongPriceFeed);
+    let age = now.saturating_sub(primary.publish_time);
+    if age <= r.max_age {
+        require!(primary.publish_time >= r.cutoff, ErrorCode::PriceBeforeCutoff);
+        return Ok((primary, r.band_bps, false));
+    }
+    require!(r.fallback_feed != [0u8; 32] && age >= r.closed_after, ErrorCode::StalePrice);
+    let fb = fallback.ok_or(ErrorCode::MissingFallbackPrice)?;
+    require!(fb.feed_id == r.fallback_feed, ErrorCode::WrongPriceFeed);
+    require!(now.saturating_sub(fb.publish_time) <= r.max_age, ErrorCode::StalePrice);
+    require!(fb.publish_time >= r.cutoff, ErrorCode::PriceBeforeCutoff);
+    Ok((fb, r.fallback_band_bps, true))
+}
+
 /// One per order. Holds the public side of the order (who, and what they
 /// deposited) and which encrypted-book slot it landed in.
 #[account]
@@ -534,6 +719,18 @@ pub struct Book {
     pub band_bps: u16,
     pub band_lo: u32,
     pub band_hi: u32,
+    pub pending_kind: u8,
+    pub pending_since: i64,
+    pub pending_computation: Pubkey,
+    pub pending_ticket: Pubkey,
+    pub pending_timeout_secs: u32,
+    pub cancelled_mask: u32,
+    pub primary_price_account: Pubkey,
+    pub fallback_feed_id: [u8; 32],
+    pub fallback_band_bps: u16,
+    pub market_closed_after_secs: u32,
+    pub last_order_at: i64,
+    pub used_fallback: bool,
 }
 
 #[derive(Accounts)]
@@ -564,6 +761,31 @@ pub struct OpenVaults<'info> {
     pub quote_vault: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExpirePending<'info> {
+    pub caller: Signer<'info>,
+    #[account(mut)]
+    pub book: Box<Account<'info, Book>>,
+    /// The pending order's ticket, required when the book is waiting on an order.
+    #[account(mut, has_one = book)]
+    pub ticket: Option<Box<Account<'info, OrderTicket>>>,
+}
+
+#[derive(Accounts)]
+pub struct CancelOrder<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+    #[account(mut)]
+    pub book: Box<Account<'info, Book>>,
+    #[account(mut, has_one = book, has_one = trader, close = trader)]
+    pub ticket: Box<Account<'info, OrderTicket>>,
+    #[account(mut)]
+    pub vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut)]
+    pub trader_token: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -667,7 +889,7 @@ pub struct InitBookCallback<'info> {
     pub book: Box<Account<'info, Book>>,
 }
 
-#[queue_computation_accounts("place_order", trader)]
+#[queue_computation_accounts("place_order_v2", trader)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
 pub struct SubmitOrder<'info> {
@@ -723,9 +945,9 @@ pub struct SubmitOrder<'info> {
     pub arcium_program: Program<'info, Arcium>,
 }
 
-#[callback_accounts("place_order")]
+#[callback_accounts("place_order_v2")]
 #[derive(Accounts)]
-pub struct PlaceOrderCallback<'info> {
+pub struct PlaceOrderV2Callback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_PLACE_ORDER))]
     pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
@@ -744,7 +966,7 @@ pub struct PlaceOrderCallback<'info> {
     pub ticket: Box<Account<'info, OrderTicket>>,
 }
 
-#[queue_computation_accounts("clear", caller)]
+#[queue_computation_accounts("clear_v2", caller)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
 pub struct ClearBatch<'info> {
@@ -752,8 +974,12 @@ pub struct ClearBatch<'info> {
     pub caller: Signer<'info>,
     #[account(mut, constraint = book.authority == caller.key() @ ErrorCode::Unauthorized)]
     pub book: Box<Account<'info, Book>>,
-    /// CHECK: owner, discriminator, verification level and feed are checked in the handler.
+    /// CHECK: must be the book's canonical Pyth account for its primary feed; owner,
+    /// discriminator, verification level and feed are checked in the handler.
     pub price_update: UncheckedAccount<'info>,
+    /// CHECK: a Pyth update for the book's fallback feed; checked in the handler and
+    /// only used when the primary price shows the exchange is closed.
+    pub fallback_update: Option<UncheckedAccount<'info>>,
     #[account(
         init_if_needed,
         space = 9,
@@ -786,9 +1012,9 @@ pub struct ClearBatch<'info> {
     pub arcium_program: Program<'info, Arcium>,
 }
 
-#[callback_accounts("clear")]
+#[callback_accounts("clear_v2")]
 #[derive(Accounts)]
-pub struct ClearCallback<'info> {
+pub struct ClearV2Callback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CLEAR))]
     pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
@@ -825,9 +1051,9 @@ pub struct InitInitBookCompDef<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[init_computation_definition_accounts("place_order", payer)]
+#[init_computation_definition_accounts("place_order_v2", payer)]
 #[derive(Accounts)]
-pub struct InitPlaceOrderCompDef<'info> {
+pub struct InitPlaceOrderV2CompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
@@ -845,9 +1071,9 @@ pub struct InitPlaceOrderCompDef<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[init_computation_definition_accounts("clear", payer)]
+#[init_computation_definition_accounts("clear_v2", payer)]
 #[derive(Accounts)]
-pub struct InitClearCompDef<'info> {
+pub struct InitClearV2CompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
@@ -881,6 +1107,7 @@ pub struct BatchClearedEvent {
     pub book: Pubkey,
     pub band_lo: u32,
     pub band_hi: u32,
+    pub used_fallback: bool,
     pub clearing_price: u32,
     pub matched: u64,
     pub fills: [u64; MAX_ORDERS as usize],
@@ -895,6 +1122,19 @@ pub struct OrderFailedEvent {
 #[event]
 pub struct ClearFailedEvent {
     pub book: Pubkey,
+}
+
+#[event]
+pub struct PendingExpiredEvent {
+    pub book: Pubkey,
+    pub kind: u8,
+}
+
+#[event]
+pub struct OrderCancelledEvent {
+    pub book: Pubkey,
+    pub slot: u8,
+    pub trader: Pubkey,
 }
 
 #[event]
@@ -950,6 +1190,22 @@ pub enum ErrorCode {
     PriceTooUncertain,
     #[msg("Reference price does not fit the book's price units")]
     PriceOutOfRange,
+    #[msg("Timeout must be greater than zero")]
+    InvalidTimeout,
+    #[msg("The book is not waiting on a computation")]
+    NothingPending,
+    #[msg("The pending computation has not timed out yet")]
+    TimeoutNotReached,
+    #[msg("This is not the ticket the book is waiting on")]
+    WrongTicket,
+    #[msg("Price was published before the last order entered the book")]
+    PriceBeforeCutoff,
+    #[msg("Primary price must be the canonical Pyth account for the book's feed")]
+    WrongPriceAccount,
+    #[msg("Exchange price is stale and no fallback price was provided")]
+    MissingFallbackPrice,
+    #[msg("Fallback needs a band at least as wide as the primary and a closed-market threshold above the max price age")]
+    InvalidFallback,
 
 }
 
@@ -1000,6 +1256,69 @@ mod price_tests {
         assert_eq!((lo, hi), (250_020_981, 260_225_919));
         // $10.00000 per share, 10-atom lots, 0-decimal tokens.
         assert_eq!(price_band(&price(1_000_000, 10, -5), 10, 0, 0, 1_000).unwrap(), (90, 110));
+    }
+
+    fn at(feed: u8, publish_time: i64) -> PythPrice {
+        PythPrice { feed_id: [feed; 32], price: 1_000_000, conf: 10, exponent: -5, publish_time }
+    }
+
+    fn rules() -> PriceRules {
+        PriceRules {
+            primary_feed: [1; 32],
+            fallback_feed: [2; 32],
+            max_age: 60,
+            closed_after: 3_600,
+            cutoff: 1_000,
+            band_bps: 200,
+            fallback_band_bps: 800,
+        }
+    }
+
+    #[test]
+    fn uses_the_exchange_price_when_fresh() {
+        let (_, bps, fb) = select_reference(1_100, &rules(), &at(1, 1_090), Some(&at(2, 1_095))).unwrap();
+        assert_eq!((bps, fb), (200, false));
+    }
+
+    #[test]
+    fn refuses_prices_from_before_the_last_order() {
+        assert!(select_reference(1_030, &rules(), &at(1, 990), None).is_err());
+        let closed = at(1, 1_030 - 7_200);
+        assert!(select_reference(1_030, &rules(), &closed, Some(&at(2, 999))).is_err());
+    }
+
+    #[test]
+    fn falls_back_only_once_the_exchange_is_closed() {
+        let now = 20_000;
+        let (_, bps, fb) = select_reference(now, &rules(), &at(1, now - 7_200), Some(&at(2, now - 5))).unwrap();
+        assert_eq!((bps, fb), (800, true));
+        // Stale, but not long enough to call the market closed: no clear.
+        assert!(select_reference(now, &rules(), &at(1, now - 600), Some(&at(2, now - 5))).is_err());
+        // Closed, but no fallback supplied, or the fallback is itself stale.
+        assert!(select_reference(now, &rules(), &at(1, now - 7_200), None).is_err());
+        assert!(select_reference(now, &rules(), &at(1, now - 7_200), Some(&at(2, now - 120))).is_err());
+        // Wrong feed in either slot.
+        assert!(select_reference(now, &rules(), &at(9, now - 5), None).is_err());
+        assert!(select_reference(now, &rules(), &at(1, now - 7_200), Some(&at(9, now - 5))).is_err());
+    }
+
+    #[test]
+    fn no_fallback_configured_means_stale_exchange_price_blocks() {
+        let mut r = rules();
+        r.fallback_feed = [0; 32];
+        assert!(select_reference(20_000, &r, &at(1, 10_000), Some(&at(2, 19_995))).is_err());
+    }
+
+    #[test]
+    fn canonical_account_matches_pyth_sdk() {
+        let aaplx: [u8; 32] = [
+            0x97, 0x8e, 0x6c, 0xc6, 0x8a, 0x11, 0x9c, 0xe0, 0x66, 0xaa, 0x83, 0x00, 0x17, 0x31, 0x85, 0x63, 0xa9, 0xed,
+            0x04, 0xec, 0x3a, 0x0a, 0x64, 0x39, 0x01, 0x0f, 0xc1, 0x12, 0x96, 0xa5, 0x86, 0x75,
+        ];
+        assert_eq!(
+            canonical_price_account(&aaplx),
+            pubkey!("Gs4DVtiGSJ9LJvXaQFjYp6vhLNK2QsH4qWox2ck1kuMp")
+        );
     }
 
     #[test]

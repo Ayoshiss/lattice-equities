@@ -21,9 +21,25 @@ test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
 startup_wait = 10000
 
 [[test.validator.account]]
+address = "DJ2FyTgUAkEtXW3U5P9PF19meFTRtW4ZWKKFgACfVbUy"
+filename = "tests/fixtures/aapl-equity-fresh.json"
+
+[[test.validator.account]]
+address = "E8WFH8brgP58arcuW2wwsPHiomYrSvrgWTsRLZLAEZUQ"
+filename = "tests/fixtures/tsla-equity-closed.json"
+
+[[test.validator.account]]
+address = "Fv8rW8VWmkX8ui8wgCQuq9hdSCK86MkUvM7itirC4QZG"
+filename = "tests/fixtures/slightly-stale.json"
+
+[[test.validator.account]]
+address = "2hMtaQCwQbPWDnxhZgLVtZ672qZmb3tNHNG8JVey8GVS"
+filename = "tests/fixtures/before-book.json"
+
+[[test.validator.account]]
 address = "H1PFU9pRg879bM4TBUsr11igtAdt1xU7zHL673jg8hsJ"
-filename = "tests/fixtures/pyth-fresh.json"
+filename = "tests/fixtures/aaplx-fallback-fresh.json"
 
 [[test.validator.account]]
 address = "FDWVP2C1f7iYugmnYCdBE91Gw91wQsboiQ2ET2V9c5JQ"
-filename = "tests/fixtures/pyth-stale.json"
+filename = "tests/fixtures/aaplx-fallback-early.json"

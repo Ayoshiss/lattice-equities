@@ -7,10 +7,12 @@ test-ledger
 .yarn
 .surfpool
 encrypted-ixs/arcis_temp_target
-build/*
-!build/*.arcis
+build/
 encrypted-ixs/src/main.rs
 artifacts/
 
 # regenerated on every local test run
 tests/fixtures/
+
+# local benchmark output
+bench-*.json
