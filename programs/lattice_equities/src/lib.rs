@@ -1,7 +1,7 @@
 //! Lattice Equities: encrypted uniform-price batch auction.
 //!
 //! The order book lives encrypted in the `Book` PDA (a packed `Book` owned by the
-//! MXE). Orders are folded in one at a time by `place_order`; `clear` computes the
+//! MXE). Orders are folded in one at a time by `place_order_v2`; `clear_v2` computes the
 //! clearing price inside MPC and reveals only the price, matched volume and
 //! per-slot fills. Limit prices and unfilled quantities are never revealed.
 //!
@@ -14,6 +14,15 @@ use arcium_anchor::prelude::*;
 use arcium_client::idl::arcium::types::{CallbackAccount, CircuitSource, OffChainCircuitSource};
 use arcium_macros::circuit_hash;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+
+#[cfg(not(feature = "no-entrypoint"))]
+solana_security_txt::security_txt! {
+    name: "Lattice Equities",
+    project_url: "https://github.com/Ayoshiss/lattice-equities",
+    contacts: "email:4yoshiss@gmail.com",
+    policy: "https://github.com/Ayoshiss/lattice-equities/blob/main/SECURITY.md",
+    source_code: "https://github.com/Ayoshiss/lattice-equities"
+}
 
 const COMP_DEF_OFFSET_INIT_BOOK: u32 = comp_def_offset("init_book");
 const COMP_DEF_OFFSET_PLACE_ORDER: u32 = comp_def_offset("place_order_v2");

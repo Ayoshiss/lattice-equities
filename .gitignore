@@ -7,7 +7,13 @@ test-ledger
 .yarn
 .surfpool
 encrypted-ixs/arcis_temp_target
-build/
+# build/ holds circuit compiler output. The program reads these four at compile
+# time, so they are kept for builds that can't run `arcium build` (verified builds).
+build/*
+!build/*.arcis
+!build/*.idarc
+!build/*.weight
+!build/*.hash
 encrypted-ixs/src/main.rs
 artifacts/
 
