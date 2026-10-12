@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+/* Lattice Equities design tokens, shared with the pitch deck. */
+@theme inline {
+  --color-page: #f4f4f8;
+  --color-card: #ffffff;
+  --color-panel: #ebebf2;
+  --color-line: #e4e4ee;
+  --color-ink: #0e1030;
+  --color-body: #4d5068;
+  --color-muted: #6e7189;
+  --color-indigo: #5546ff;
+  --color-indigo-deep: #4033e0;
+  --color-tint: #e9e7ff;
+  --color-lime: #c8f560;
+  --color-night: #13153a;
+  --color-night-2: #1e2152;
+  --color-amber: #ffb547;
+  --color-haze: #8f93bd;
+  --font-sans: var(--font-manrope);
+  --font-mono: var(--font-jetbrains);
+}
+
+html {
+  background: var(--color-page);
+  color: var(--color-ink);
+}
+
+body {
+  background: var(--color-page);
+  font-family: var(--font-manrope), Arial, sans-serif;
+}
+
+.card {
+  background: var(--color-card);
+  border: 1px solid var(--color-line);
+  border-radius: 24px;
+  box-shadow: 0 12px 40px rgba(14, 16, 48, 0.06);
+}
+
+/* The "sealed" badge: a small pop and one shine sweep each time an order is re-sealed. */
+@keyframes seal-pop {
+  0% { transform: scale(0.9); }
+  60% { transform: scale(1.07); }
+  100% { transform: scale(1); }
+}
+@keyframes seal-shine {
+  from { transform: translateX(-150%) skewX(-20deg); }
+  to { transform: translateX(350%) skewX(-20deg); }
+}
+.seal-pop { animation: seal-pop 0.35s ease-out; }
+.seal-shine { position: relative; overflow: hidden; }
+.seal-shine::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.8), transparent);
+  animation: seal-shine 0.7s ease-out 0.1s both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .seal-pop, .seal-shine::after { animation: none; }
+}
+
+/* Landing tape: each newly sealed row slides in. */
+@keyframes tape-in {
+  from { transform: translateY(-10px); opacity: 0; background: rgba(255, 181, 71, 0.18); }
+  to { transform: none; background: transparent; }
+}
+.tape-new { animation: tape-in 0.35s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .tape-new { animation: none; }
+}
+
+/* Landing polish */
+html { scroll-behavior: smooth; }
+::selection { background: #ffb547; color: #13153a; }
+:focus-visible { outline: 2px solid #ffb547; outline-offset: 3px; border-radius: 6px; }
+.tnum { font-variant-numeric: tabular-nums; }
+@keyframes cue { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(4px); } }
+.cue { animation: cue 1.8s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .cue { animation: none; } }
