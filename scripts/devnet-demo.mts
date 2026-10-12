@@ -69,6 +69,7 @@ const program = new Program(idl, provider) as Program<any>;
 const arcium = getArciumProgram(provider);
 const clusterAccount = getClusterAccAddress(CLUSTER_OFFSET);
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const explorer = (kind: "tx" | "address", id: string) => `https://explorer.solana.com/${kind}/${id}?cluster=devnet`;
 
 const queueAccounts = (offset: any, circuit: string) => ({
   computationAccount: getComputationAccAddress(CLUSTER_OFFSET, offset),
@@ -79,6 +80,19 @@ const queueAccounts = (offset: any, circuit: string) => ({
   compDefAccount: getCompDefAccAddress(program.programId, Buffer.from(getCompDefAccOffset(circuit)).readUInt32LE()),
 });
 const finalize = (offset: any) => awaitComputationFinalization(provider, offset, program.programId, "confirmed");
+
+// Arcium nodes race to deliver a callback and only the first lands; the
+// signature finalize returns can be a loser that failed with
+// AlreadyCallbackedComputation. Find the transaction that carries the event.
+async function landedTx(account: PublicKey, event: string): Promise<string | null> {
+  const parser = new anchor.EventParser(program.programId, program.coder);
+  for (const s of await connection.getSignaturesForAddress(account, { limit: 20 }, "confirmed")) {
+    if (s.err) continue;
+    const tx = await connection.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+    for (const ev of parser.parseLogs(tx?.meta?.logMessages ?? [])) if (ev.name === event) return s.signature;
+  }
+  return null;
+}
 
 async function registerCircuits() {
   const builders: Record<string, () => any> = {
@@ -199,6 +213,7 @@ async function main() {
   const cipher = new RescueCipher(x25519.getSharedSecret(secret, mxeKey!));
   const orderMs: number[] = [];
   const relayTxs: string[] = [];
+  const orderTxs: string[] = [];
   for (const [i, o] of orders.entries()) {
     const nonce = randomBytes(16);
     const ct = cipher.encrypt([BigInt(o.side), BigInt(o.price), BigInt(o.qty)], nonce);
@@ -239,6 +254,7 @@ async function main() {
     const receipt = res.headers.get("x-payment-response");
     const paid = receipt ? JSON.parse(Buffer.from(receipt, "base64").toString()).transaction : "none";
     relayTxs.push(paid);
+    orderTxs.push(body.signature);
     await finalize(offset);
     orderMs.push(Date.now() - t0);
     log(`order ${i + 1} via relay in ${orderMs[i]} ms (order tx ${body.signature.slice(0, 8)}…, fee tx ${String(paid).slice(0, 8)}…)`);
@@ -259,12 +275,13 @@ async function main() {
 
   t0 = Date.now();
   const clearOffset = new BN(randomBytes(8), "hex");
-  await program.methods
+  const clearTx = await program.methods
     .clearBatch(clearOffset)
     .accountsPartial({ caller: owner.publicKey, book, priceUpdate, fallbackUpdate: null, ...queueAccounts(clearOffset, "clear_v2") })
     .rpc({ commitment: "confirmed" });
-  await finalize(clearOffset);
+  const finalizeTx = await finalize(clearOffset);
   timings.clear_ms = Date.now() - t0;
+  const clearResultTx = (await landedTx(book, "batchClearedEvent")) ?? finalizeTx;
   const cleared = await (program.account as any).book.fetch(book);
   const fills = cleared.fills.slice(0, orders.length).map((f: any) => f.toNumber());
   log(
@@ -293,6 +310,11 @@ async function main() {
     Number((await getAccount(connection, vault(baseMint))).amount) === 0 &&
     Number((await getAccount(connection, vault(quoteMint))).amount) === 0;
   log(`vaults empty: ${vaultsEmpty}`);
+  console.log(`
+encrypted order  ${explorer("tx", orderTxs[0])}
+clear request    ${explorer("tx", clearTx)}
+clear result     ${explorer("tx", clearResultTx)}
+book             ${explorer("address", book.toBase58())}`);
 
   writeFileSync(
     "bench-devnet-e2e.json",
